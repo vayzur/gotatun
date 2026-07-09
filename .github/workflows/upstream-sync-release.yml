@@ -1,0 +1,280 @@
+name: Sync Upstream And Release gotatun-cli
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */6 * * *"
+
+concurrency:
+  group: gotatun-release-${{ github.event.repository.default_branch }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TARGET_BRANCH: ${{ github.event.repository.default_branch }}
+  UPSTREAM_REPOSITORY: mullvad/gotatun
+  UPSTREAM_BRANCH: main
+  BINARY_NAME: gotatun
+  LATEST_RELEASE_TAG: latest
+
+jobs:
+  prepare:
+    name: Sync Fork And Prepare Metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      branch: ${{ steps.sync.outputs.branch }}
+      head_sha: ${{ steps.sync.outputs.head_sha }}
+      release_exists: ${{ steps.release_check.outputs.release_exists }}
+      latest_release_exists: ${{ steps.release_check.outputs.latest_release_exists }}
+      latest_tag_matches_head: ${{ steps.release_check.outputs.latest_tag_matches_head }}
+      release_tag: ${{ steps.sync.outputs.release_tag }}
+      release_title: ${{ steps.sync.outputs.release_title }}
+      should_release: ${{ steps.release_check.outputs.should_release }}
+      sync_changed: ${{ steps.sync.outputs.sync_changed }}
+      upstream_commit_date: ${{ steps.sync.outputs.upstream_commit_date }}
+      upstream_commit_tag_date: ${{ steps.sync.outputs.upstream_commit_tag_date }}
+      upstream_sha: ${{ steps.sync.outputs.upstream_sha }}
+      upstream_short_sha: ${{ steps.sync.outputs.upstream_short_sha }}
+      upstream_subject: ${{ steps.sync.outputs.upstream_subject }}
+    steps:
+      - name: Check out fork branch
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ env.TARGET_BRANCH }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Sync fork with upstream
+        id: sync
+        run: ./scripts/sync-upstream.sh
+
+      - name: Check whether the release already exists
+        id: release_check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ steps.sync.outputs.head_sha }}
+          IS_MANUAL: ${{ github.event_name == 'workflow_dispatch' }}
+          LATEST_RELEASE_TAG: ${{ env.LATEST_RELEASE_TAG }}
+          RELEASE_TAG: ${{ steps.sync.outputs.release_tag }}
+          SYNC_CHANGED: ${{ steps.sync.outputs.sync_changed }}
+        run: |
+          release_exists=false
+          latest_release_exists=false
+          latest_tag_matches_head=false
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            release_exists=true
+          fi
+
+          latest_tag_sha="$(git ls-remote --tags origin "refs/tags/${LATEST_RELEASE_TAG}^{}" | awk '{print $1}')"
+          if [ -n "${latest_tag_sha}" ] && [ "${latest_tag_sha}" = "${HEAD_SHA}" ]; then
+            latest_tag_matches_head=true
+          fi
+
+          if gh release view "${LATEST_RELEASE_TAG}" >/dev/null 2>&1; then
+            latest_release_exists=true
+          fi
+
+          should_release=false
+          if [ "${IS_MANUAL}" = "true" ] || [ "${SYNC_CHANGED}" = "true" ]; then
+            should_release=true
+          fi
+
+          echo "release_exists=${release_exists}" >> "${GITHUB_OUTPUT}"
+          echo "latest_release_exists=${latest_release_exists}" >> "${GITHUB_OUTPUT}"
+          echo "latest_tag_matches_head=${latest_tag_matches_head}" >> "${GITHUB_OUTPUT}"
+          echo "should_release=${should_release}" >> "${GITHUB_OUTPUT}"
+
+  build:
+    needs:
+      - prepare
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            build_tool: cargo
+          - runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            build_tool: cross
+    steps:
+      - name: Check out synced head
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.head_sha }}
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          rustflags: ""
+
+      - name: Install cross
+        if: matrix.build_tool == 'cross'
+        uses: taiki-e/install-action@cross
+
+      - name: Build gotatun
+        run: |
+          if [ "${{ matrix.build_tool }}" = "cross" ]; then
+            cross build --locked --release --package gotatun-cli --bin gotatun --target "${{ matrix.target }}"
+          else
+            cargo build --locked --release --package gotatun-cli --bin gotatun --target "${{ matrix.target }}"
+          fi
+
+      - name: Package release archive
+        run: ./scripts/package-release-asset.sh "${{ matrix.target }}"
+
+      - name: Upload packaged assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/
+          retention-days: 7
+
+  release:
+    name: Publish Release
+    needs:
+      - prepare
+      - build
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Check out synced head
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.prepare.outputs.head_sha }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Assemble release checksums
+        run: cat dist/*.sha256 > dist/SHA256SUMS
+
+      - name: Create release tag
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          RELEASE_TITLE: ${{ needs.prepare.outputs.release_title }}
+        run: |
+          if ! git rev-parse --verify "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            git tag -a "${RELEASE_TAG}" -m "${RELEASE_TITLE}"
+          fi
+
+          if ! git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            git push origin "refs/tags/${RELEASE_TAG}"
+          fi
+
+      - name: Write immutable release notes
+        run: |
+          cat <<'EOF' > release-notes.md
+          Automated release of `${{ env.BINARY_NAME }}`.
+
+          - Upstream repository: https://github.com/${{ env.UPSTREAM_REPOSITORY }}
+          - Upstream branch: `${{ env.UPSTREAM_BRANCH }}`
+          - Upstream commit: `${{ needs.prepare.outputs.upstream_sha }}`
+          - Upstream commit time (UTC): `${{ needs.prepare.outputs.upstream_commit_date }}`
+          - Upstream subject: ${{ needs.prepare.outputs.upstream_subject }}
+
+          This fork keeps its default branch exactly one commit ahead of upstream so the fork only carries release automation and related maintenance.
+          EOF
+
+      - name: Publish immutable GitHub release
+        if: needs.prepare.outputs.release_exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          RELEASE_TITLE: ${{ needs.prepare.outputs.release_title }}
+        run: |
+          gh release create "${RELEASE_TAG}" dist/* \
+            --verify-tag \
+            --title "${RELEASE_TITLE}" \
+            --notes-file release-notes.md
+
+      - name: Prepare latest release assets
+        run: |
+          mkdir -p dist/latest
+          cp dist/*-linux dist/latest/
+          cp dist/*.sha256 dist/latest/
+
+          if command -v sha256sum >/dev/null 2>&1; then
+            (
+              cd dist/latest
+              sha256sum *-linux > SHA256SUMS
+            )
+          else
+            (
+              cd dist/latest
+              shasum -a 256 *-linux > SHA256SUMS
+            )
+          fi
+
+      - name: Update latest tag
+        env:
+          HEAD_SHA: ${{ needs.prepare.outputs.head_sha }}
+          LATEST_RELEASE_TAG: ${{ env.LATEST_RELEASE_TAG }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: |
+          git tag -fa "${LATEST_RELEASE_TAG}" -m "Latest build for ${RELEASE_TAG}" "${HEAD_SHA}"
+          git push origin "refs/tags/${LATEST_RELEASE_TAG}" --force
+
+      - name: Write latest release notes
+        run: |
+          cat <<'EOF' > latest-release-notes.md
+          Latest moving release of `${{ env.BINARY_NAME }}`.
+
+          - Immutable release tag: `${{ needs.prepare.outputs.release_tag }}`
+          - Upstream repository: https://github.com/${{ env.UPSTREAM_REPOSITORY }}
+          - Upstream branch: `${{ env.UPSTREAM_BRANCH }}`
+          - Upstream commit: `${{ needs.prepare.outputs.upstream_sha }}`
+          - Upstream commit time (UTC): `${{ needs.prepare.outputs.upstream_commit_date }}`
+          - Upstream subject: ${{ needs.prepare.outputs.upstream_subject }}
+
+          The `latest` tag is intentionally moved forward to the newest successful build.
+          EOF
+
+      - name: Delete previous latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LATEST_RELEASE_TAG: ${{ env.LATEST_RELEASE_TAG }}
+        run: |
+          if gh release view "${LATEST_RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release delete "${LATEST_RELEASE_TAG}" --yes
+          fi
+
+      - name: Publish latest GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LATEST_RELEASE_TAG: ${{ env.LATEST_RELEASE_TAG }}
+        run: |
+          gh release create "${LATEST_RELEASE_TAG}" dist/latest/* \
+            --verify-tag \
+            --title "${LATEST_RELEASE_TAG}" \
+            --notes-file latest-release-notes.md
